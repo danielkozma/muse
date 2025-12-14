@@ -1,0 +1,663 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Entangled Line — Slower Return + Slower Square Fade</title>
+<style>
+  html,body{height:100%}
+  body{margin:0;background:#ECEBE7;color:#111;overflow:hidden;font:12px system-ui}
+  canvas{display:block;width:100vw;height:100vh;touch-action:none}
+</style></head>
+<body>
+<canvas id="stage"></canvas>
+<script>
+(function(){
+'use strict';
+
+// ===== Control Panel Default Values =====
+const DEFAULT_LINE_COLOR = '#A7A199';
+const DEFAULT_RANDOM_SEED = 20;
+const DEFAULT_GLOBAL_SCALE = 1.6; // Global scale multiplier (1.0 = 100%, 2.0 = 200%, etc.)
+
+// ===== Particle System Constants =====
+// All values in vw units (viewport width)
+const BASE_SQUARE_SIZE = 0.01; // 0.01vw
+const DUPLICATE_POOL_SIZE = 64;
+const DUPLICATE_JITTER = 0.5; // 0.5vw
+
+// ===== Particle Group A Default Values =====
+// All size/drift/radius values in vw units
+const DEFAULT_GROUP_A_SQUARE_COLOR = '#ECEBE7';
+const DEFAULT_GROUP_A_SQUARE_COUNT = 1000;
+const DEFAULT_GROUP_A_MAX_EXTRA_COPIES = 30;
+const DEFAULT_GROUP_A_MAX_SIZE = 1.0; // 2.0vw
+const DEFAULT_GROUP_A_MIN_SIZE = 0.3; // 0.2vw
+const DEFAULT_GROUP_A_SIZE_VARIANCE = 1;
+const DEFAULT_GROUP_A_MAX_DRIFT = 5.0; // 5.0vw
+const DEFAULT_GROUP_A_MIN_DRIFT = 0.1; // 1.0vw
+const DEFAULT_GROUP_A_FALLOFF_RADIUS = 15.0; // 15.0vw
+
+// ===== Particle Group B Default Values =====
+// All size/drift/radius values in vw units
+const DEFAULT_GROUP_B_SQUARE_COUNT = 500;
+const DEFAULT_GROUP_B_MAX_EXTRA_COPIES = 0;
+const DEFAULT_GROUP_B_MAX_SIZE = 2; // 1.5vw
+const DEFAULT_GROUP_B_MIN_SIZE = 0.2; // 0.2vw
+const DEFAULT_GROUP_B_SIZE_VARIANCE = 3;
+const DEFAULT_GROUP_B_MAX_DRIFT = 8.0; // 5.0vw
+const DEFAULT_GROUP_B_MIN_DRIFT = 0.2; // 0.2vw
+const DEFAULT_GROUP_B_FALLOFF_RADIUS = 15.0; // 15.0vw
+const DEFAULT_GROUP_B_SPECIAL_HIGHLIGHTS = 10;
+
+// ===== Group B Color Palettes =====
+const GROUP_B_BASE_PALETTE = ['#A7A199', '#7C6E67', '#D1CDC5'];
+const GROUP_B_ACCENT_PALETTE = ['#7C6E67', '#D1CDC5'];
+const GROUP_B_HIGHLIGHT_COLOR = '#41CFBA';
+
+// ===== Automatic Cycle Timing Default Values =====
+const DEFAULT_CYCLE_WAIT_TIME = 2000; // ms - wait before effect begins
+const DEFAULT_CYCLE_SCALE_UP_TIME = 6000; // ms - time to scale up
+const DEFAULT_CYCLE_SCALE_DOWN_TIME = 6000; // ms - time to scale down
+const DEFAULT_CYCLE_PAUSE_TIME = 1000; // ms - pause at maximum
+
+const C=document.getElementById('stage'),ctx=C.getContext('2d'); if(!ctx){return;}
+let W=0,H=0,DPR=Math.min(2,devicePixelRatio||1);
+// VW conversion: 1vw = viewport width / 100, multiplied by global scale
+function vwToPx(vw) { return (vw / 100) * innerWidth * globalScale; }
+function pxToVw(px) { return (px / innerWidth) * 100 / globalScale; }
+function resize(){W=innerWidth;H=innerHeight;C.width=W*DPR;C.height=H*DPR;C.style.width=W+'px';C.style.height=H+'px';ctx.setTransform(DPR,0,0,DPR,0,0);}
+addEventListener('resize',resize,{passive:true});resize();
+
+const TAU=2*Math.PI, clamp=(x,a,b)=>Math.max(a,Math.min(b,x)), lerp=(a,b,t)=>a+(b-a)*t;
+function smoothstep(a,b,x){ const t=clamp((x-a)/(b-a),0,1); return t*t*(3-2*t); }
+
+// ===== baseline you liked =====
+// All values in vw units for scaling
+const P={ samples:420, terms:8, kMax:9, radius:1, zAmp:.5,
+          fovVw:Math.min(100, (H/W)*100)*.95, camZ:3, base:0.07, var:0.375 }; // base and var in vw
+const speed=1.3;
+
+
+// ===== rng + curve =====
+function rng(seed){return()=>{seed|=0;seed=(seed+0x6D2B79F5)|0;let t=Math.imul(seed^seed>>>15,1|seed);t^=t+Math.imul(t^t>>>7,61|t);return((t^t>>>14)>>>0)/4294967296;}}
+function makeTerms(r,n,a,k){const used={},arr=[];for(let i=0;i<n;i++){let K=1+Math.floor(r()*k);while(used[K])K=1+Math.floor(r()*k);used[K]=1;arr.push({K,a:r()*2*a-a,b:r()*2*a-a,p:r()*TAU,q:r()*TAU,da:(r()<.5?-1:1)*r()*.22,db:(r()<.5?-1:1)*r()*.22});}return arr;}
+function Curve(seed,t,k){const r=rng(seed);this.tx=makeTerms(r,t,P.radius,k);this.ty=makeTerms(r,t,P.radius,k);this.tz=makeTerms(r,t,P.zAmp,Math.max(3,k));}
+Curve.prototype.eval=function(th,t){let x=0,y=0,z=0;
+  for(const o of this.tx)x+=o.a*Math.sin(o.K*th+o.p+o.da*t)+o.b*Math.cos(o.K*th+o.q+o.db*t);
+  for(const o of this.ty)y+=o.a*Math.sin(o.K*th+o.p+o.da*t)+o.b*Math.cos(o.K*th+o.q+o.db*t);
+  for(const o of this.tz)z+=o.a*Math.sin(o.K*th+o.p+o.da*t)+o.b*Math.cos(o.K*th+o.q+o.db*t);
+  return{x,y,z};
+};
+function project(p){const d=P.camZ-p.z, fovPx=vwToPx(P.fovVw), s=fovPx/(d<.5?.5:d); return {sx:W/2+p.x*s, sy:H/2+p.y*s, s};}
+
+// ===== state =====
+let M=P.samples,raw=Array(M),pts=Array(M),w=new Float32Array(M);
+for(let i=0;i<M;i++){raw[i]={};pts[i]={};}
+
+// ===== Automatic Cycle System =====
+
+// Easing functions for smooth particle appearance/disappearance
+function easeInOutCubic(t) {
+  return t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2;
+}
+
+function easeInOutQuart(t) {
+  return t < 0.5 ? 8 * t * t * t * t : 1 - Math.pow(-2 * t + 2, 4) / 2;
+}
+
+// Custom easing: ease-in (very slow start), accelerate, then ease-out (decelerate at end)
+function easeScaleUp(t) {
+  // Ease-in-out pattern: very slow start, accelerate in middle, decelerate at end
+  if (t < 0.3) {
+    // Very slow start (ease-in) - first 30% of time only gets to ~8% progress
+    // Particles appear one by one, very gradually
+    const early = t / 0.3;
+    return 0.08 * (early * early * early * early * early); // quintic for very slow start
+  } else if (t < 0.7) {
+    // Accelerate in middle 40% - goes from ~8% to ~92%
+    // More and more particles appear quickly
+    const mid = (t - 0.3) / 0.4;
+    const eased = easeInOutCubic(mid); // smooth acceleration
+    return 0.08 + 0.84 * eased;
+  } else {
+    // Decelerate at end (ease-out) - last 30% goes from ~92% to 100% slowly
+    // Effect slows down as it approaches full extent
+    const late = (t - 0.7) / 0.3;
+    // Ease-out: start fast, slow down at end
+    const eased = 1 - Math.pow(1 - late, 4); // quartic ease-out for smooth deceleration
+    return 0.92 + 0.08 * eased;
+  }
+}
+
+// Scale down: completely separate from scale up
+// Ease-in for first half (slow start, accelerates), then ease-out for second half (decelerates, very slow end)
+function easeScaleDown(t) {
+  if (t < 0.5) {
+    // First 50%: Ease-in - slowly scaling down, then accelerating
+    // Particles disappear slowly at first, then more and more disappear faster
+    const early = t / 0.5; // 0 to 1
+    const eased = early * early * early * early; // quartic ease-in for smooth acceleration
+    return 1.0 - 0.5 * eased; // goes from 1.0 to 0.5
+  } else {
+    // Second 50%: Ease-out - decelerating, very slow end
+    // Effect gets slower and slower, fewer and fewer particles disappear
+    // Last few particles disappear one by one, very gradually
+    const late = (t - 0.5) / 0.5; // 0 to 1
+    const eased = 1 - Math.pow(1 - late, 6); // sextic ease-out for very gradual end
+    return 0.5 * (1 - eased); // goes from 0.5 to 0.0, very slowly at the end
+  }
+}
+
+function calculateCycleInfluence(now, phaseOffset = 0) {
+  const { waitTime, scaleUpTime, scaleDownTime, pauseTime } = cycleState;
+  const totalCycleTime = waitTime + scaleUpTime + pauseTime + scaleDownTime;
+  const cycleTime = now % totalCycleTime;
+  
+  if (cycleTime < waitTime) {
+    // Waiting phase - no particles (all at 0)
+    return 0;
+  } else if (cycleTime < waitTime + scaleUpTime) {
+    // Scaling up phase - particles appear at different times due to phase offset
+    // Phase offset only affects when they START appearing, but all reach 1 by the end
+    const progress = (cycleTime - waitTime) / scaleUpTime;
+    
+    // Ensure all particles are at 1.0 by the end of scale up
+    if (progress >= 1.0) {
+      return 1.0;
+    }
+    
+    // Use easeScaleUp to control WHEN particles appear (staggered appearance timing)
+    // This creates the gradual "one by one" appearance effect with the 30/40/30 easing
+    // Phase offset spreads particles over 70% of the appearance timing
+    const phaseSpreadFraction = 0.7;
+    const phaseOffsetProgress = phaseOffset * phaseSpreadFraction;
+    
+    // Find when this particle should appear by finding the progress where easeScaleUp equals phaseOffsetProgress
+    // We'll use binary search or approximation to find the inverse of easeScaleUp
+    // For now, let's approximate: find progress where easeScaleUp(progress) >= phaseOffsetProgress
+    let appearProgress = 0;
+    const step = 0.01;
+    for (let p = 0; p <= 1.0; p += step) {
+      if (easeScaleUp(p) >= phaseOffsetProgress) {
+        appearProgress = p;
+        break;
+      }
+    }
+    
+    // Check if this particle has appeared yet
+    if (progress < appearProgress) {
+      return 0; // Particle hasn't appeared yet
+    }
+    
+    // Once this particle appears, it immediately starts its own smooth animation
+    // Calculate how far through its animation it is (from 0 to 1)
+    // The particle animates from when it appears to the end of scale up time
+    const animationDuration = 1.0 - appearProgress;
+    const particleAnimationProgress = animationDuration > 0.001 
+      ? (progress - appearProgress) / animationDuration
+      : 1.0;
+    
+    // Apply smooth ease-in-out for the particle's own animation (scaling and moving)
+    // This is the particle's continuous animation from 0 to 1, starting immediately when it appears
+    const particleAnimation = easeInOutCubic(Math.min(1.0, Math.max(0, particleAnimationProgress)));
+    
+    return Math.min(1.0, particleAnimation);
+  } else if (cycleTime < waitTime + scaleUpTime + pauseTime) {
+    // Pause at maximum - all particles at full extent (all at 1)
+    return 1;
+  } else {
+    // Scaling down phase - particles disappear at different times due to phase offset
+    // Each particle's animation (scaling and moving) should complete exactly when it disappears
+    const downStart = waitTime + scaleUpTime + pauseTime;
+    const progress = (cycleTime - downStart) / scaleDownTime;
+    
+    // Ensure all particles are at 0.0 by the end of scale down
+    if (progress >= 1.0) {
+      return 0.0;
+    }
+    
+    // Use easeScaleDown to control WHEN particles disappear (staggered disappearance timing)
+    // This creates the gradual "one by one" disappearance effect
+    const disappearanceTiming = easeScaleDown(Math.min(1.0, progress));
+    
+    // Phase offset spreads particles over 70% of the disappearance timing for staggered disappearance
+    // Particles with phaseOffset=0 disappear at the very end, phaseOffset=1 disappear earlier
+    const phaseSpreadFraction = 0.7;
+    const phaseOffsetProgress = phaseOffset * phaseSpreadFraction;
+    
+    // Find when this particle should disappear by finding the progress where easeScaleDown equals (1 - phaseOffsetProgress)
+    // Since easeScaleDown goes from 1 to 0, we need to find when it reaches the threshold
+    let disappearProgress = 1.0;
+    const step = 0.01;
+    const threshold = 1.0 - phaseOffsetProgress;
+    for (let p = 0; p <= 1.0; p += step) {
+      if (easeScaleDown(p) <= threshold) {
+        disappearProgress = p;
+        break;
+      }
+    }
+    
+    // Check if this particle has disappeared yet
+    if (progress >= disappearProgress) {
+      return 0.0; // Particle has disappeared
+    }
+    
+    // Once scale down starts, each particle immediately begins its own smooth animation
+    // Calculate how far through its animation it is (from 1.0 to 0.0)
+    // The particle animates from when scale down starts to when it disappears
+    const animationDuration = disappearProgress;
+    const particleAnimationProgress = animationDuration > 0.001 
+      ? progress / animationDuration
+      : 1.0;
+    
+    // Apply smooth ease-in-out for the particle's own animation (scaling and moving)
+    // This is the particle's continuous animation from 1.0 to 0.0, completing exactly when it disappears
+    const particleAnimation = easeInOutCubic(Math.min(1.0, Math.max(0, particleAnimationProgress)));
+    
+    // Invert to go from 1.0 to 0.0
+    return 1.0 - particleAnimation;
+  }
+}
+
+// ===== Particle System =====
+
+const drawSquare = (x, y, size, color) => {
+  ctx.fillStyle = color;
+  ctx.fillRect(x - size / 2, y - size / 2, size, size);
+};
+
+let baseSquaresA = [];
+let baseSquaresB = [];
+
+// Exponential distribution function for particle sizes
+// Returns values between 0 and 1, with more values near 0 (small particles) and fewer near 1 (large particles)
+// Higher exponent = more concentration at small values
+function exponentialSizeDistribution(exponent = 2.5) {
+  return Math.pow(Math.random(), exponent);
+}
+
+const generateSquares = (count, basePalette, isGroupB = false) => {
+  if (count <= 0) {
+    return [];
+  }
+  
+  // For Group B, determine which particles should be highlights at creation time
+  const highlightCount = isGroupB ? Math.min(count, Math.max(0, Math.round(particleStateB.specialHighlights || 0))) : 0;
+  const highlightIndices = new Set();
+  if (highlightCount > 0) {
+    const indices = Array.from({ length: count }, (_, i) => i);
+    indices.sort(() => Math.random() - 0.5);
+    for (let i = 0; i < highlightCount; i++) {
+      highlightIndices.add(indices[i]);
+    }
+  }
+  
+  return Array.from({ length: count }, (_, index) => {
+    const directionAngle = Math.random() * TAU;
+    const curveIndex = index;
+    // Give each particle a random phase offset (0 to 1)
+    // This makes appearance sequence completely random, not based on curve order
+    const phaseOffset = Math.random();
+
+    const duplicates = Array.from({ length: DUPLICATE_POOL_SIZE }, (_, dupIndex) => {
+      const duplicateAngle = Math.random() * TAU;
+      // Assign permanent color to duplicate (same as base particle or from palette)
+      let duplicateColor = basePalette[(index + dupIndex) % basePalette.length];
+      // For Group B duplicates, use same color logic (but not highlights)
+      if (isGroupB) {
+        const useAccent = Math.random() < 0.5;
+        if (useAccent && GROUP_B_ACCENT_PALETTE && GROUP_B_ACCENT_PALETTE.length > 0) {
+          duplicateColor = GROUP_B_ACCENT_PALETTE[Math.floor(Math.random() * GROUP_B_ACCENT_PALETTE.length)];
+        } else {
+          duplicateColor = basePalette[(index + dupIndex) % basePalette.length];
+        }
+      }
+      return {
+        threshold: Math.random(),
+        dirX: Math.cos(duplicateAngle),
+        dirY: Math.sin(duplicateAngle),
+        offsetX: Math.random() * 2 - 1,
+        offsetY: Math.random() * 2 - 1,
+        scaleFactor: isGroupB ? exponentialSizeDistribution(2.5) : Math.random(),
+        driftFactor: Math.random(),
+        sizeVariance: Math.random() * 2 - 1,
+        colorSeed: Math.random(),
+        accentSeed: Math.random(),
+        paletteIndex: (index + dupIndex) % basePalette.length,
+        specialSeed: Math.random(),
+        permanentColor: duplicateColor, // Permanent color assigned at creation
+      };
+    }).sort((a, b) => a.threshold - b.threshold);
+
+    // Assign permanent color to this particle (never changes)
+    let permanentColor = basePalette[index % basePalette.length];
+    // For Group B, use color logic to assign permanent color
+    if (isGroupB) {
+      // Check if this particle should be a highlight
+      if (highlightIndices.has(index) && GROUP_B_HIGHLIGHT_COLOR) {
+        permanentColor = GROUP_B_HIGHLIGHT_COLOR;
+      } else {
+        // Assign base or accent color based on random
+        const useAccent = Math.random() < 0.5;
+        if (useAccent && GROUP_B_ACCENT_PALETTE && GROUP_B_ACCENT_PALETTE.length > 0) {
+          permanentColor = GROUP_B_ACCENT_PALETTE[Math.floor(Math.random() * GROUP_B_ACCENT_PALETTE.length)];
+        } else {
+          permanentColor = basePalette[index % basePalette.length];
+        }
+      }
+    }
+    
+    return {
+      baseX: 0,
+      baseY: 0,
+      curveIndex: index,
+      totalCount: count,
+      phaseOffset: phaseOffset, // Unique phase offset for this particle
+      dirX: Math.cos(directionAngle),
+      dirY: Math.sin(directionAngle),
+      scaleFactor: isGroupB ? exponentialSizeDistribution(2.5) : Math.random(),
+      driftFactor: Math.random(),
+      sizeVariance: Math.random() * 2 - 1,
+      colorSeed: Math.random(),
+      accentSeed: Math.random(),
+      paletteIndex: index % basePalette.length,
+      specialSeed: Math.random(),
+      permanentColor: permanentColor, // Permanent color assigned at creation
+      duplicates,
+    };
+  });
+};
+
+const updateParticlePositions = (baseSquares) => {
+  if (pts.length === 0 || baseSquares.length === 0) return;
+  
+  baseSquares.forEach((square) => {
+    const t = (square.curveIndex / square.totalCount) * pts.length;
+    const i0 = Math.floor(t) % pts.length;
+    const i1 = (i0 + 1) % pts.length;
+    const frac = t - Math.floor(t);
+    
+    square.baseX = pts[i0].sx + (pts[i1].sx - pts[i0].sx) * frac;
+    square.baseY = pts[i0].sy + (pts[i1].sy - pts[i0].sy) * frac;
+  });
+};
+
+// Initialize particle states from defaults
+let particleStateA = {
+  squareColor: DEFAULT_GROUP_A_SQUARE_COLOR,
+  squareCount: DEFAULT_GROUP_A_SQUARE_COUNT,
+  maxExtraCopies: DEFAULT_GROUP_A_MAX_EXTRA_COPIES,
+  maxSize: DEFAULT_GROUP_A_MAX_SIZE,
+  minSize: DEFAULT_GROUP_A_MIN_SIZE,
+  sizeVariance: DEFAULT_GROUP_A_SIZE_VARIANCE,
+  maxDrift: DEFAULT_GROUP_A_MAX_DRIFT,
+  minDrift: DEFAULT_GROUP_A_MIN_DRIFT,
+  falloffRadius: DEFAULT_GROUP_A_FALLOFF_RADIUS,
+};
+let particleStateB = {
+  squareCount: DEFAULT_GROUP_B_SQUARE_COUNT,
+  maxExtraCopies: DEFAULT_GROUP_B_MAX_EXTRA_COPIES,
+  maxSize: DEFAULT_GROUP_B_MAX_SIZE,
+  minSize: DEFAULT_GROUP_B_MIN_SIZE,
+  sizeVariance: DEFAULT_GROUP_B_SIZE_VARIANCE,
+  maxDrift: DEFAULT_GROUP_B_MAX_DRIFT,
+  minDrift: DEFAULT_GROUP_B_MIN_DRIFT,
+  falloffRadius: DEFAULT_GROUP_B_FALLOFF_RADIUS,
+  specialHighlights: DEFAULT_GROUP_B_SPECIAL_HIGHLIGHTS,
+};
+
+// Initialize cycle state from defaults
+let cycleState = {
+  waitTime: DEFAULT_CYCLE_WAIT_TIME,
+  scaleUpTime: DEFAULT_CYCLE_SCALE_UP_TIME,
+  scaleDownTime: DEFAULT_CYCLE_SCALE_DOWN_TIME,
+  pauseTime: DEFAULT_CYCLE_PAUSE_TIME,
+};
+
+// Initialize other values from defaults
+let lineColor = DEFAULT_LINE_COLOR;
+let seed = DEFAULT_RANDOM_SEED;
+let globalScale = DEFAULT_GLOBAL_SCALE;
+
+const updateBaseSquaresA = () => {
+  baseSquaresA = generateSquares(Math.max(0, Math.round(particleStateA.squareCount)), ['#ffffff'], false);
+};
+
+const updateBaseSquaresB = () => {
+  baseSquaresB = generateSquares(Math.max(0, Math.round(particleStateB.squareCount)), GROUP_B_BASE_PALETTE, true);
+};
+
+// Initialize curve and particles
+let curve = new Curve(seed, P.terms, P.kMax);
+updateBaseSquaresA();
+updateBaseSquaresB();
+
+let ws=1, lastT=performance.now(), firstFrame=true;
+function frame(now){
+  requestAnimationFrame(frame);
+  const tAbs=now*1e-3*.22*speed;
+  const dt = Math.min(0.05, (now - lastT)/1000); lastT = now;
+
+  P.fovVw=Math.min(100, (H/W)*100)*.95;
+
+  // sample curve & frame
+  let rMax=0,zNear=-1e9;
+  for(let i=0;i<M;i++){
+    const p=curve.eval(i/M*TAU,tAbs); raw[i]=p;
+    const r=Math.hypot(p.x,p.y); if(r>rMax) rMax=r; if(p.z>zNear) zNear=p.z;
+  }
+  rMax=Math.max(rMax,1e-4);
+  const fovPx=vwToPx(P.fovVw);
+  const A=(Math.min(W,H)*.44)/(fovPx*rMax||1);
+  const targetWs=(A*P.camZ)/(1+A*Math.max(0,zNear));
+  // On first frame, set directly to avoid reveal animation
+  if(firstFrame){
+    ws=targetWs;
+    firstFrame=false;
+  }else{
+    ws=lerp(ws,targetWs,.1);
+  }
+
+  // project + widths
+  // Apply global scale to curve size
+  const scaledWs = ws * globalScale;
+  let sMin=1e9,sMax=-1e9;
+  for(let i=0;i<M;i++){
+    const p=raw[i],ps={x:p.x*scaledWs,y:p.y*scaledWs,z:p.z*scaledWs},pr=project(ps);
+    pts[i]={...ps,...pr}; sMin=Math.min(sMin,pr.s); sMax=Math.max(sMax,pr.s);
+  }
+  const dS=Math.max(1e-6,sMax-sMin);
+  for(let i=0;i<M;i++){const sn=Math.max(0,Math.min(1,(pts[i].s-sMin)/dS)); w[i]=vwToPx(P.base + P.var*Math.pow(sn,1.5));}
+
+  // update particle positions along curve
+  updateParticlePositions(baseSquaresA);
+  updateParticlePositions(baseSquaresB);
+
+  // draw
+  ctx.clearRect(0,0,W,H);
+
+  // ===== LINE (no fade, always visible) =====
+  ctx.strokeStyle=lineColor;
+    ctx.lineJoin='round'; ctx.lineCap='round';
+  ctx.globalAlpha=1;
+    for(let i=0;i<M;i++){
+      const j=(i+1)%M;
+      ctx.beginPath(); ctx.moveTo(pts[i].sx,pts[i].sy); ctx.lineTo(pts[j].sx,pts[j].sy);
+      ctx.lineWidth=(w[i]+w[j])/2; ctx.stroke();
+    }
+
+  // ===== PARTICLES GROUP A (White) =====
+  {
+    const {
+      squareColor,
+      maxSize,
+      minSize,
+      sizeVariance,
+      minDrift,
+      maxDrift,
+      maxExtraCopies,
+    } = particleStateA;
+
+    if (maxSize > 0) {
+      const driftRange = Math.max(0, maxDrift - minDrift);
+      const extraLimit = Math.max(0, Math.round(maxExtraCopies));
+
+      baseSquaresA.forEach((square) => {
+        // Calculate unique influence for this particle based on its phase offset
+        const influence = calculateCycleInfluence(now, square.phaseOffset);
+        
+        // Skip if influence is 0 (particle not visible)
+        if (influence <= 0) return;
+        const baseDrift = vwToPx(minDrift + square.driftFactor * driftRange * influence);
+        const varianceMultiplier = Math.max(
+          0,
+          1 + square.sizeVariance * sizeVariance * (1 - influence)
+        );
+        const size = vwToPx(Math.max(
+          minSize,
+          (BASE_SQUARE_SIZE + square.scaleFactor * maxSize * influence) * varianceMultiplier
+        ));
+        const x = square.baseX + square.dirX * baseDrift;
+        const y = square.baseY + square.dirY * baseDrift;
+
+        drawSquare(x, y, size, squareColor);
+
+        if (extraLimit <= 0) {
+          return;
+        }
+
+        const duplicatesToUse = Math.min(extraLimit, square.duplicates.length);
+        for (let i = 0; i < duplicatesToUse; i += 1) {
+          const duplicate = square.duplicates[i];
+          if (influence < duplicate.threshold) {
+            break;
+          }
+
+          const duplicateDrift = vwToPx(minDrift + duplicate.driftFactor * driftRange * influence);
+          const variance = Math.max(
+            0,
+            1 + duplicate.sizeVariance * sizeVariance * (1 - influence)
+          );
+          const duplicateSize = vwToPx(Math.max(
+            minSize,
+            (BASE_SQUARE_SIZE + duplicate.scaleFactor * maxSize * influence) * variance
+          ));
+          const xDup =
+            square.baseX +
+            duplicate.dirX * duplicateDrift +
+            duplicate.offsetX * vwToPx(DUPLICATE_JITTER) * influence;
+          const yDup =
+            square.baseY +
+            duplicate.dirY * duplicateDrift +
+            duplicate.offsetY * vwToPx(DUPLICATE_JITTER) * influence;
+
+          drawSquare(xDup, yDup, duplicateSize, squareColor);
+        }
+      });
+    }
+  }
+
+  // ===== PARTICLES GROUP B (Colored) =====
+  {
+    const {
+      maxSize: maxSizeB,
+      minSize: minSizeB,
+      sizeVariance: sizeVarianceB,
+      minDrift: minDriftB,
+      maxDrift: maxDriftB,
+      maxExtraCopies: maxExtraCopiesB,
+      specialHighlights,
+    } = particleStateB;
+
+    if (maxSizeB > 0) {
+      const driftRangeB = Math.max(0, maxDriftB - minDriftB);
+      const extraLimitB = Math.max(0, Math.round(maxExtraCopiesB));
+      const activeEntries = [];
+
+      baseSquaresB.forEach((square) => {
+        // Calculate unique influence for this particle based on its phase offset
+        const influence = calculateCycleInfluence(now, square.phaseOffset);
+        
+        // Skip if influence is 0 (particle not visible)
+        if (influence <= 0) return;
+        const baseDrift = vwToPx(minDriftB + square.driftFactor * driftRangeB * influence);
+        const varianceMultiplier = Math.max(
+          0,
+          1 + square.sizeVariance * sizeVarianceB * (1 - influence)
+        );
+        const size = vwToPx(Math.max(
+          minSizeB,
+          (BASE_SQUARE_SIZE + square.scaleFactor * maxSizeB * influence) * varianceMultiplier
+        ));
+        const x = square.baseX + square.dirX * baseDrift;
+        const y = square.baseY + square.dirY * baseDrift;
+
+        activeEntries.push({
+          x,
+          y,
+          size,
+          influence,
+          colorSeed: square.colorSeed,
+          accentSeed: square.accentSeed,
+          paletteIndex: square.paletteIndex,
+          specialSeed: square.specialSeed,
+          permanentColor: square.permanentColor, // Use permanent color
+        });
+
+        if (extraLimitB <= 0) {
+          return;
+        }
+
+        const duplicatesToUse = Math.min(extraLimitB, square.duplicates.length);
+        for (let i = 0; i < duplicatesToUse; i += 1) {
+          const duplicate = square.duplicates[i];
+          if (influence < duplicate.threshold) {
+            break;
+          }
+
+          const duplicateDrift = vwToPx(minDriftB + duplicate.driftFactor * driftRangeB * influence);
+          const variance = Math.max(
+            0,
+            1 + duplicate.sizeVariance * sizeVarianceB * (1 - influence)
+          );
+          const duplicateSize = vwToPx(Math.max(
+            minSizeB,
+            (BASE_SQUARE_SIZE + duplicate.scaleFactor * maxSizeB * influence) * variance
+          ));
+          const xDup =
+            square.baseX +
+            duplicate.dirX * duplicateDrift +
+            duplicate.offsetX * vwToPx(DUPLICATE_JITTER) * influence;
+          const yDup =
+            square.baseY +
+            duplicate.dirY * duplicateDrift +
+            duplicate.offsetY * vwToPx(DUPLICATE_JITTER) * influence;
+
+          activeEntries.push({
+            x: xDup,
+            y: yDup,
+            size: duplicateSize,
+            influence,
+            colorSeed: duplicate.colorSeed,
+            accentSeed: duplicate.accentSeed,
+            paletteIndex: duplicate.paletteIndex,
+            specialSeed: duplicate.specialSeed,
+            permanentColor: duplicate.permanentColor, // Use permanent color
+          });
+        }
+      });
+
+      if (activeEntries.length > 0) {
+        // Use permanent colors assigned at creation (never change)
+        // Draw Group B particles with their permanent colors
+        activeEntries.forEach((entry) => {
+          drawSquare(entry.x, entry.y, entry.size, entry.permanentColor);
+        });
+      }
+    }
+  }
+
+}
+requestAnimationFrame(frame);
+})();
+</script>
+</body></html>
